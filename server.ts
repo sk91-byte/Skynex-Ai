@@ -1,19 +1,28 @@
 import express, { Request, Response } from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
 import { z } from 'zod';
 import mammoth from 'mammoth';
-import { BRANDS, INITIAL_RECURRING_PATTERNS } from './src/data/mockBrands.ts';
+import {
+  BRANDS,
+  INITIAL_AUDIT_HISTORY,
+  DEFAULT_RECURRENCE_CONFIG
+} from './src/data/mockBrands.ts';
 import {
   AuditFinding,
   AuditReport,
   BrandProfile,
+  BrandRule,
   RecurringPattern,
-  GuidelineRule,
+  RecurrenceThresholdConfig,
   ReviewStatusOutcome,
-  DraftVersion
+  DraftVersion,
+  DecisionStatus,
+  ContentApprovalStatus,
+  AffectedDraftRef
 } from './src/types.ts';
 
 dotenv.config();
@@ -25,38 +34,68 @@ const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const IS_PROD = process.env.NODE_ENV === 'production';
 
-// Support file uploads up to 15MB
 app.use(express.json({ limit: '15mb' }));
 
-// Structured JSON request logging with X-Request-Id
-let requestCounter = 0;
-app.use((req, res, next) => {
-  const reqId = `req_${Date.now()}_${++requestCounter}`;
-  res.setHeader('X-Request-Id', reqId);
-  const startTime = Date.now();
-  res.on('finish', () => {
-    const duration = Date.now() - startTime;
-    if (!req.url.startsWith('/@') && !req.url.includes('.')) {
-      console.log(JSON.stringify({
-        level: 'info',
-        time: new Date().toISOString(),
-        requestId: reqId,
-        method: req.method,
-        url: req.url,
-        status: res.statusCode,
-        durationMs: duration
-      }));
+// Persistent JSON Store Path so state survives reloads & server restarts
+const DATA_FILE_PATH = path.resolve(__dirname, '.skynex-persistent-store.json');
+
+interface SavedInvestigation {
+  status: 'monitoring' | 'alert_active' | 'investigating' | 'resolved';
+  rootCause?: 'unclear_guidelines' | 'outdated_approved_info' | 'training_need';
+  rootCauseNotes?: string;
+  correctiveActionTaken?: string;
+  investigatedBy?: string;
+  actionDate?: string;
+}
+
+interface PersistentState {
+  brands: Record<string, BrandProfile>;
+  auditHistory: AuditReport[];
+  investigations: Record<string, SavedInvestigation>;
+  recurrenceConfig: RecurrenceThresholdConfig;
+}
+
+function getInitialState(): PersistentState {
+  return {
+    brands: JSON.parse(JSON.stringify(BRANDS)),
+    auditHistory: JSON.parse(JSON.stringify(INITIAL_AUDIT_HISTORY)),
+    investigations: {},
+    recurrenceConfig: { ...DEFAULT_RECURRENCE_CONFIG }
+  };
+}
+
+function loadPersistentState(): PersistentState {
+  try {
+    if (fs.existsSync(DATA_FILE_PATH)) {
+      const raw = fs.readFileSync(DATA_FILE_PATH, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.brands && Array.isArray(parsed.auditHistory)) {
+        return {
+          brands: parsed.brands,
+          auditHistory: parsed.auditHistory,
+          investigations: parsed.investigations || {},
+          recurrenceConfig: parsed.recurrenceConfig || { ...DEFAULT_RECURRENCE_CONFIG }
+        };
+      }
     }
-  });
-  next();
-});
+  } catch (err) {
+    console.warn('[SkyNex AI] Could not load persistent state from disk, using canonical defaults:', err);
+  }
+  return getInitialState();
+}
 
-// Server-side repositories
-let brandStore: Record<string, BrandProfile> = JSON.parse(JSON.stringify(BRANDS));
-let recurringPatterns: RecurringPattern[] = JSON.parse(JSON.stringify(INITIAL_RECURRING_PATTERNS));
-let auditHistory: AuditReport[] = [];
+function savePersistentState(state: PersistentState) {
+  try {
+    fs.writeFileSync(DATA_FILE_PATH, JSON.stringify(state, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('[SkyNex AI] Failed to write persistent state to disk:', err);
+  }
+}
 
-// Gemini Client initialization
+let store: PersistentState = loadPersistentState();
+savePersistentState(store);
+
+// Gemini Client initialization (Server-side only with required User-Agent header)
 let genAiClient: GoogleGenAI | null = null;
 if (process.env.GEMINI_API_KEY) {
   genAiClient = new GoogleGenAI({
@@ -69,403 +108,741 @@ if (process.env.GEMINI_API_KEY) {
   });
 }
 
-// ----------------------------------------------------
-// Deterministic Verification Engine (Python/TS Core)
-// ----------------------------------------------------
-function runDeterministicAudit(brand: BrandProfile, draftText: string): AuditFinding[] {
-  const findings: AuditFinding[] = [];
-  const text = draftText;
-
-  // 1. Exact Brand Naming Checks
-  if (brand.id === 'aerosip') {
-    const nameRegex = /\b(aero\s+sip|aerosip)\b/gi;
-    let match;
-    while ((match = nameRegex.exec(text)) !== null) {
-      if (match[0] !== 'AeroSip') {
-        findings.push({
-          id: `det-name-${Date.now()}-${findings.length}`,
-          classification: 'confirmed_rule_conflict',
-          category: 'Terminology',
-          severity: 'critical',
-          originalSpan: match[0],
-          startIndex: match.index,
-          endIndex: match.index + match[0].length,
-          conflictText: `"${match[0]}" violates approved brand name "AeroSip"`,
-          ruleId: 'AS-G01',
-          approvedRuleCitation: 'AeroSip Identity Manual 2026, Rule 1.1',
-          sourceReference: 'AeroSip Identity Manual 2026 v3.1',
-          explanation: 'The brand name must be written strictly as single word "AeroSip" with capital A and S. Spaced or uncapitalized variants dilute trademark integrity.',
-          suggestedReplacement: 'AeroSip',
-          requiresHumanReview: false,
-          engine: 'deterministic',
-          decision: 'pending',
-          timestamp: new Date().toISOString()
-        });
-      }
-    }
-  } else if (brand.id === 'novapay') {
-    const nameRegex = /\b(nova\s+pay|nova-pay|novapay)\b/gi;
-    let match;
-    while ((match = nameRegex.exec(text)) !== null) {
-      if (match[0] !== 'NovaPay') {
-        findings.push({
-          id: `det-name-${Date.now()}-${findings.length}`,
-          classification: 'confirmed_rule_conflict',
-          category: 'Terminology',
-          severity: 'critical',
-          originalSpan: match[0],
-          startIndex: match.index,
-          endIndex: match.index + match[0].length,
-          conflictText: `"${match[0]}" violates approved brand naming "NovaPay"`,
-          ruleId: 'NP-G01',
-          approvedRuleCitation: 'Brand Guidelines 2026 Q3, Rule 1.1 (Brand Identity)',
-          sourceReference: 'NovaPay Trademark Manual',
-          explanation: 'The brand name must be written strictly as single camel-cased word "NovaPay".',
-          suggestedReplacement: 'NovaPay',
-          requiresHumanReview: false,
-          engine: 'deterministic',
-          decision: 'pending',
-          timestamp: new Date().toISOString()
-        });
-      }
-    }
-  }
-
-  // 2. Exact Fact & Pricing Checks
-  if (brand.id === 'aerosip') {
-    // Check for promotional price conflict (e.g. ₹899 vs approved ₹999)
-    const priceRegex = /(?:₹|INR|Rs\.?|\$)\s*(\d[\d,]*)/gi;
-    let pMatch;
-    while ((pMatch = priceRegex.exec(text)) !== null) {
-      const cleanNum = parseInt(pMatch[1].replace(/,/g, ''), 10);
-      if (cleanNum === 899 || (cleanNum < 999 && cleanNum > 300)) {
-        findings.push({
-          id: `det-price-${Date.now()}-${findings.length}`,
-          classification: 'approved_fact_conflict',
-          category: 'Pricing & Facts',
-          severity: 'critical',
-          originalSpan: pMatch[0],
-          startIndex: pMatch.index,
-          endIndex: pMatch.index + pMatch[0].length,
-          conflictText: `"${pMatch[0]}" conflicts with approved promotional price of ₹999`,
-          ruleId: 'AS-G02',
-          approvedRuleCitation: 'Commercial Price Schedule 2026, Section 2',
-          sourceReference: 'Rate Card 2026 Q3',
-          explanation: `The approved promotional offer price for the Smart Hydration Vessel is ₹999. Quoting ${pMatch[0]} causes regulatory advertising breaches and commercial margin violations.`,
-          suggestedReplacement: '₹999',
-          requiresHumanReview: false,
-          engine: 'deterministic',
-          decision: 'pending',
-          timestamp: new Date().toISOString()
-        });
-      }
-    }
-
-    // 3. Performance claim check (PRD Section 8 Canonical Demo requirement)
-    // "Keeps drinks cold for 48 hours" marked as unsupported/unverified (not automatically false!)
-    const coldRegex = /\b(?:keeps?\s+drinks?\s+cold\s+for\s+(\d+)\s*hours?|cold\s+for\s+(\d+)\s*hours?)\b/gi;
-    let cMatch;
-    while ((cMatch = coldRegex.exec(text)) !== null) {
-      const hours = parseInt(cMatch[1] || cMatch[2], 10);
-      if (hours > 24) {
-        findings.push({
-          id: `det-claim-${Date.now()}-${findings.length}`,
-          classification: 'unsupported_claim',
-          category: 'Performance Claims',
-          severity: 'warning',
-          originalSpan: cMatch[0],
-          startIndex: cMatch.index,
-          endIndex: cMatch.index + cMatch[0].length,
-          conflictText: `Performance claim "${cMatch[0]}" is unverified by approved lab certification`,
-          ruleId: 'AS-G03',
-          approvedRuleCitation: 'Technical Specifications & Lab Certifications, Doc TS-04',
-          sourceReference: 'Intertek Lab Test Report #4412',
-          explanation: `Intertek Lab Report #4412 certifies 24-hour cold retention for standard vessel. The ${hours}-hour claim is unsupported by current documentation and requires human verification (not automatically false).`,
-          suggestedReplacement: 'Keeps drinks cold for 24 hours',
-          requiresHumanReview: true,
-          engine: 'deterministic',
-          decision: 'pending',
-          timestamp: new Date().toISOString()
-        });
-      }
-    }
-  } else if (brand.id === 'novapay') {
-    // NovaPay Standard rate is ₹999/month
-    const priceRegex = /(?:₹|INR|Rs\.?|\$)\s*(\d[\d,]*)(?:\s*\/\s*(?:month|mo|per month))?/gi;
-    let pMatch;
-    while ((pMatch = priceRegex.exec(text)) !== null) {
-      const statedPrice = parseInt(pMatch[1].replace(/,/g, ''), 10);
-      const isMonthly = /(month|mo)/i.test(pMatch[0]) || /subscribe|plan|rate|pricing/i.test(text);
-      if (isMonthly && statedPrice !== 999) {
-        findings.push({
-          id: `det-price-${Date.now()}-${findings.length}`,
-          classification: 'approved_fact_conflict',
-          category: 'Pricing & Facts',
-          severity: 'critical',
-          originalSpan: pMatch[0],
-          startIndex: pMatch.index,
-          endIndex: pMatch.index + pMatch[0].length,
-          conflictText: `"${pMatch[0]}" conflicts with approved Standard Rate of ₹999/month`,
-          ruleId: 'NP-G02',
-          approvedRuleCitation: 'Commercial Rate Card v3.4, Section 2 (Pricing Integrity)',
-          sourceReference: 'Rate Card v3.4',
-          explanation: `Approved monthly subscription is ₹999/month. Stating ${pMatch[0]} causes regulatory advertising breaches under ASA guidelines.`,
-          suggestedReplacement: '₹999/month',
-          requiresHumanReview: false,
-          engine: 'deterministic',
-          decision: 'pending',
-          timestamp: new Date().toISOString()
-        });
-      }
-    }
-  }
-
-  // 4. Prohibited Phrases & Banned Lexicon
-  for (const term of brand.prohibitedTerms) {
-    const escaped = term.term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const termRegex = new RegExp(`\\b${escaped}\\b`, 'gi');
-    let tMatch;
-    while ((tMatch = termRegex.exec(text)) !== null) {
-      findings.push({
-        id: `det-prohib-${Date.now()}-${findings.length}`,
-        classification: 'confirmed_rule_conflict',
-        category: term.category,
-        severity: term.severity,
-        originalSpan: tMatch[0],
-        startIndex: tMatch.index,
-        endIndex: tMatch.index + tMatch[0].length,
-        conflictText: `"${tMatch[0]}" is an explicitly prohibited phrase`,
-        ruleId: brand.id === 'novapay' ? 'NP-G03' : 'AS-G04',
-        approvedRuleCitation: brand.id === 'novapay'
-          ? 'Regulatory Compliance Directive 4.2 (Anti-Deceptive Marketing)'
-          : 'Health Claims Compliance & CDSCO Standards, Doc 8.3',
-        sourceReference: brand.id === 'novapay' ? 'RBI Compliance Directive 4.2' : 'CDSCO Regulatory Notice',
-        explanation: term.explanation,
-        suggestedReplacement: term.suggestedAlternative,
-        requiresHumanReview: false,
-        engine: 'deterministic',
-        decision: 'pending',
-        timestamp: new Date().toISOString()
-      });
-    }
-  }
-
-  // 5. Required Statutory Disclaimers
-  for (const disc of brand.requiredDisclaimers) {
-    const hasTrigger = new RegExp(`\\b${disc.triggerKeyword}\\b`, 'i').test(text);
-    const hasDisclaimer = text.includes(disc.disclaimerText.slice(0, 30));
-    if (hasTrigger && !hasDisclaimer) {
-      findings.push({
-        id: `det-disc-${Date.now()}-${findings.length}`,
-        classification: 'confirmed_rule_conflict',
-        category: 'Regulatory & Claims',
-        severity: 'warning',
-        originalSpan: 'Full Draft Body',
-        startIndex: text.length,
-        endIndex: text.length,
-        conflictText: `Missing mandatory statutory disclaimer for "${disc.triggerKeyword}" reference`,
-        approvedRuleCitation: 'Statutory Notice Requirements 2026',
-        sourceReference: 'Brand Regulatory Annex',
-        explanation: `${disc.reason}: Content mentioning "${disc.triggerKeyword}" must append the approved disclaimer text.`,
-        suggestedReplacement: `\n\n*Disclaimer: ${disc.disclaimerText}*`,
-        requiresHumanReview: true,
-        engine: 'deterministic',
-        decision: 'pending',
-        timestamp: new Date().toISOString()
-      });
-    }
-  }
-
-  return findings;
+// ---------------------------------------------------------------------------
+// 1. DETERMINISTIC RULES ENGINE
+// Strictly evaluates ONLY rules where status === 'Approved'
+// ---------------------------------------------------------------------------
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// ----------------------------------------------------
-// Gemini Contextual Review Engine (Strictly Validated)
-// ----------------------------------------------------
+function runDeterministicAudit(brand: BrandProfile, draftText: string): {
+  findings: AuditFinding[];
+  approvedRulesCount: number;
+} {
+  // CRITICAL REQUIREMENT: Only Approved rules may be treated as authoritative.
+  // Draft or unverified rules must NEVER silently become approved information.
+  const approvedRules = brand.rules.filter(r => r.status === 'Approved');
+  const rawFindings: AuditFinding[] = [];
+
+  for (const rule of approvedRules) {
+    // 1. Check explicit targetPatterns defined on the rule (longest patterns first to prevent partial overlap)
+    const sortedPatterns = [...rule.targetPatterns]
+      .map(p => p.trim())
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length);
+
+    for (const pattern of sortedPatterns) {
+      const escaped = escapeRegExp(pattern);
+      // Use boundary-aware regex if pattern starts/ends with word chars, otherwise substring regex
+      const startsWithWord = /^\w/.test(pattern);
+      const endsWithWord = /\w$/.test(pattern);
+      const regexStr = `${startsWithWord ? '\\b' : ''}${escaped}${endsWithWord ? '\\b' : ''}`;
+      const regex = new RegExp(regexStr, 'gi');
+
+      let match: RegExpExecArray | null;
+      while ((match = regex.exec(draftText)) !== null) {
+        const matchedText = match[0];
+        // If it's a Terminology rule and the matched text is already identical in case/spelling to approvedValue, skip
+        if (rule.category === 'Terminology' && matchedText === rule.approvedValue) {
+          continue;
+        }
+
+        const startIndex = match.index;
+        const endIndex = startIndex + matchedText.length;
+
+        // Check if this span overlaps an existing finding for the same rule or another deterministic match
+        const overlaps = rawFindings.some(
+          existing => !(endIndex <= existing.startIndex || startIndex >= existing.endIndex)
+        );
+        if (overlaps) continue;
+
+        let conflictLabel = `Conflicts with approved rule "${rule.title}"`;
+        if (rule.category === 'Terminology') {
+          conflictLabel = `Terminology conflict: "${matchedText}" differs from the approved product name "${rule.approvedValue}".`;
+        } else if (rule.category === 'Pricing & Facts') {
+          conflictLabel = `Price conflict: "${matchedText}" conflicts with the approved price of ${rule.approvedValue}.`;
+        } else if (rule.category === 'Prohibited Claim') {
+          conflictLabel = `Prohibited claim: "${matchedText}" conflicts with the explicitly prohibited rule.`;
+        } else if (rule.category === 'Performance & Claims') {
+          conflictLabel = `Unsupported claim: "${matchedText}" lacks approved supporting evidence and requires human verification.`;
+        } else {
+          conflictLabel = `Tone & style suggestion: "${matchedText}" departs from "${rule.title}".`;
+        }
+
+        rawFindings.push({
+          id: `det-${rule.id}-${startIndex}-${rawFindings.length + 1}`,
+          classification: rule.classification,
+          category: rule.category,
+          severity: rule.severity,
+          originalSpan: matchedText,
+          startIndex,
+          endIndex,
+          conflictText: conflictLabel,
+          ruleId: rule.id,
+          ruleTitle: rule.title,
+          approvedRuleCitation: rule.sourceRef,
+          sourceReference: rule.sourceRef,
+          explanation: rule.explanation,
+          suggestedReplacement: rule.approvedValue,
+          requiresHumanReview:
+            rule.classification === 'unsupported_claim' ||
+            rule.classification === 'needs_human_verification',
+          engine: 'deterministic',
+          decision: 'pending',
+          timestamp: new Date().toISOString()
+        });
+      }
+    }
+
+    // 2. Smart Structured Price & Fact Check for any Pricing & Facts rule
+    // Detects novel wrong prices (e.g. ₹399/month, ₹599 per month, $59/mo) even if not listed in targetPatterns
+    if (rule.category === 'Pricing & Facts') {
+      const approvedNumMatch = rule.approvedValue.match(/(\d[\d,]*)/);
+      const approvedNumber = approvedNumMatch ? parseInt(approvedNumMatch[1].replace(/,/g, ''), 10) : null;
+
+      if (approvedNumber !== null) {
+        const priceRegex = /(?:₹|INR\s*|Rs\.?\s*|\$)(\d[\d,]*)(?:\s*(?:\/\s*(?:month|mo)|per\s+month))?/gi;
+        let pMatch: RegExpExecArray | null;
+        while ((pMatch = priceRegex.exec(draftText)) !== null) {
+          const matchedSpan = pMatch[0];
+          const foundNum = parseInt(pMatch[1].replace(/,/g, ''), 10);
+          const startIndex = pMatch.index;
+          const endIndex = startIndex + matchedSpan.length;
+
+          if (foundNum !== approvedNumber) {
+            const overlaps = rawFindings.some(
+              existing => !(endIndex <= existing.startIndex || startIndex >= existing.endIndex)
+            );
+            if (!overlaps) {
+              rawFindings.push({
+                id: `det-price-${rule.id}-${startIndex}-${rawFindings.length + 1}`,
+                classification: 'approved_fact_conflict',
+                category: 'Pricing & Facts',
+                severity: 'critical',
+                originalSpan: matchedSpan,
+                startIndex,
+                endIndex,
+                conflictText: `Price conflict: "${matchedSpan}" conflicts with the approved price of ${rule.approvedValue}.`,
+                ruleId: rule.id,
+                ruleTitle: rule.title,
+                approvedRuleCitation: rule.sourceRef,
+                sourceReference: rule.sourceRef,
+                explanation: rule.explanation,
+                suggestedReplacement: rule.approvedValue,
+                requiresHumanReview: false,
+                engine: 'deterministic',
+                decision: 'pending',
+                timestamp: new Date().toISOString()
+              });
+            }
+          }
+        }
+      }
+    }
+
+    // 3. Smart Unverified Cold-Retention Hours Check for AeroSip (AS-RULE-03)
+    if (rule.id === 'AS-RULE-03') {
+      const hoursRegex = /\b(?:keeps?\s+drinks?\s+cold\s+for\s+(\d+)\s*hours?|cold\s+for\s+(\d+)\s*hours?)\b/gi;
+      let hMatch: RegExpExecArray | null;
+      while ((hMatch = hoursRegex.exec(draftText)) !== null) {
+        const hours = parseInt(hMatch[1] || hMatch[2], 10);
+        if (hours > 24) {
+          const matchedSpan = hMatch[0];
+          const startIndex = hMatch.index;
+          const endIndex = startIndex + matchedSpan.length;
+          const overlaps = rawFindings.some(
+            existing => !(endIndex <= existing.startIndex || startIndex >= existing.endIndex)
+          );
+          if (!overlaps) {
+            rawFindings.push({
+              id: `det-claim-${rule.id}-${startIndex}-${rawFindings.length + 1}`,
+              classification: 'unsupported_claim',
+              category: 'Performance & Claims',
+              severity: 'warning',
+              originalSpan: matchedSpan,
+              startIndex,
+              endIndex,
+              conflictText: `Unsupported claim: "${matchedSpan}" exceeds certified 24-hour specification and requires human verification.`,
+              ruleId: rule.id,
+              ruleTitle: rule.title,
+              approvedRuleCitation: rule.sourceRef,
+              sourceReference: rule.sourceRef,
+              explanation: `${rule.explanation} (Stated ${hours} hours vs certified 24 hours; missing supporting evidence does not automatically prove the claim is false, but requires human verification).`,
+              suggestedReplacement: rule.approvedValue,
+              requiresHumanReview: true,
+              engine: 'deterministic',
+              decision: 'pending',
+              timestamp: new Date().toISOString()
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Sort findings by appearance order in the text
+  rawFindings.sort((a, b) => a.startIndex - b.startIndex);
+
+  return {
+    findings: rawFindings,
+    approvedRulesCount: approvedRules.length
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 2. AI-ASSISTED CONTEXTUAL REVIEW ENGINE (Zod-Validated & Rule-Verified)
+// ---------------------------------------------------------------------------
+const GeminiContextualIssueSchema = z.object({
+  matchedSpan: z.string(),
+  classification: z.enum(['unsupported_claim', 'style_tone_suggestion', 'needs_human_verification']).optional(),
+  category: z.string().optional(),
+  ruleId: z.string().optional(),
+  explanation: z.string(),
+  suggestedReplacement: z.string().optional(),
+  requiresHumanReview: z.boolean().optional()
+});
+
+const GeminiResponseSchema = z.object({
+  toneSummary: z.string(),
+  contextualIssues: z.array(GeminiContextualIssueSchema)
+});
+
+interface GeminiAuditResult {
+  additionalFindings: AuditFinding[];
+  toneSummary: string;
+  success: boolean;
+  errorMsg?: string;
+}
+
 async function runGeminiContextualAudit(
   brand: BrandProfile,
   draftText: string,
-  deterministicFindings: AuditFinding[]
-): Promise<{ additionalFindings: AuditFinding[]; toneSummary: string; compliantDraft: string; success: boolean }> {
-  if (!genAiClient) {
-    let fallbackCompliant = draftText;
-    for (const f of deterministicFindings) {
-      if (f.originalSpan && f.originalSpan !== 'Full Draft Body' && f.suggestedReplacement) {
-        fallbackCompliant = fallbackCompliant.split(f.originalSpan).join(f.suggestedReplacement);
-      }
-    }
+  deterministicFindings: AuditFinding[],
+  simulateAiUnavailable = false
+): Promise<GeminiAuditResult> {
+  if (simulateAiUnavailable) {
     return {
       additionalFindings: [],
-      toneSummary: 'Deterministic rules evaluated with 100% precision. Contextual AI review was not invoked.',
-      compliantDraft: fallbackCompliant,
-      success: false
+      toneSummary: 'Contextual AI service was unavailable (simulated outage). Deterministic checks ran completely; contextual review is marked incomplete.',
+      success: false,
+      errorMsg: 'AI service unavailable — contextual review marked incomplete while deterministic checks succeeded.'
     };
   }
 
+  if (!genAiClient) {
+    return {
+      additionalFindings: [],
+      toneSummary: 'Gemini API key not configured on server. Deterministic rules evaluated; contextual AI review marked incomplete.',
+      success: false,
+      errorMsg: 'Contextual AI service not configured; deterministic checks completed.'
+    };
+  }
+
+  // Only pass Approved rules to the AI so it never uses Draft or Unverified rules
+  const approvedRules = brand.rules.filter(r => r.status === 'Approved');
+  const approvedRuleMap = new Map<string, BrandRule>(approvedRules.map(r => [r.id, r]));
+
   try {
-    const prompt = `You are SkyNex AI, an authoritative brand compliance auditor.
-Audit the following marketing draft against verified brand knowledge for "${brand.name}".
+    const prompt = `You are SkyNex AI, an enterprise brand-governance contextual reviewer for the brand "${brand.name}" (${brand.industry}).
+Your job is to review the submitted draft ONLY against the APPROVED brand rules listed below.
 
-BRAND INFORMATION & ACTIVE GUIDELINES:
-${brand.guidelines.map(g => `* [Rule ${g.id}] (${g.category}): ${g.rule} Citation: ${g.citation}`).join('\n')}
-* Approved Facts:
-${brand.facts.map(f => `  - ${f.key}: ${f.approvedValue} (${f.context})`).join('\n')}
-* Prohibited Lexicon:
-${brand.prohibitedTerms.map(p => `  - Prohibited: "${p.term}" - ${p.explanation}`).join('\n')}
+APPROVED BRAND RULES (Authoritative Knowledge Base):
+${approvedRules
+  .map(
+    r =>
+      `- Rule ID: ${r.id} | Category: ${r.category} | Title: ${r.title}\n  Statement: ${r.ruleStatement}\n  Approved Value: "${r.approvedValue}"\n  Source Reference: ${r.sourceRef}`
+  )
+  .join('\n')}
 
-DETERMINISTIC CONFLICTS ALREADY CAUGHT:
-${deterministicFindings.map(d => `- "${d.originalSpan}": ${d.conflictText}`).join('\n') || 'None'}
+DETERMINISTIC FINDINGS ALREADY DETECTED (DO NOT DUPLICATE THESE SPANS):
+${
+  deterministicFindings.length > 0
+    ? deterministicFindings.map(d => `- Span "${d.originalSpan}" flagged under ${d.ruleId}: ${d.conflictText}`).join('\n')
+    : 'None'
+}
 
-DRAFT TO AUDIT:
+SUBMITTED DRAFT TO REVIEW:
 """
 ${draftText}
 """
 
-CRITICAL INSTRUCTIONS:
-1. Do not invent rules, facts, citations, or source IDs that are not present above.
-2. Distinguish unverified claims from false claims: if a claim lacks proof in the approved facts, classify it as "unsupported_claim" with requiresHumanReview: true.
-3. Suggest targeted corrections only when supported by approved brand facts.
-4. Provide a 1-sentence tone summary.`;
+STRICT INSTRUCTIONS:
+1. NEVER invent approved facts, supporting evidence, source citations, or rule IDs. Every ruleId you cite MUST be one of: ${approvedRules.map(r => r.id).join(', ')}.
+2. Do NOT duplicate any span already listed in DETERMINISTIC FINDINGS ALREADY DETECTED.
+3. Look ONLY for additional contextual issues in the draft (such as unsupported promotional/performance claims that require supporting evidence, or clear tone/messaging conflicts) that were missed by exact keyword matching.
+4. Remember: A missing supporting source does not automatically prove a claim is false; classify unsupported promotional claims as "unsupported_claim" with requiresHumanReview: true.
+5. If all issues in the draft are already covered by the deterministic findings (or if the draft is clean), return an empty array [] for contextualIssues.
+6. Provide a concise 1-sentence toneSummary evaluating the draft's overall tone and brand alignment.`;
 
-    const response = await genAiClient.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            toneSummary: { type: Type.STRING },
-            compliantDraft: { type: Type.STRING },
-            contextualIssues: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  matchedSpan: { type: Type.STRING },
-                  category: { type: Type.STRING },
-                  severity: { type: Type.STRING },
-                  ruleCitation: { type: Type.STRING },
-                  ruleId: { type: Type.STRING },
-                  explanation: { type: Type.STRING },
-                  suggestedReplacement: { type: Type.STRING },
-                  requiresHumanReview: { type: Type.BOOLEAN }
-                },
-                required: ['matchedSpan', 'ruleCitation', 'explanation', 'suggestedReplacement']
+    const callGeminiWithTimeout = async (modelName: string) => {
+      const aiPromise = genAiClient.models.generateContent({
+        model: modelName,
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              toneSummary: { type: Type.STRING },
+              contextualIssues: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    matchedSpan: { type: Type.STRING },
+                    classification: { type: Type.STRING },
+                    category: { type: Type.STRING },
+                    ruleId: { type: Type.STRING },
+                    explanation: { type: Type.STRING },
+                    suggestedReplacement: { type: Type.STRING },
+                    requiresHumanReview: { type: Type.BOOLEAN }
+                  },
+                  required: ['matchedSpan', 'explanation']
+                }
               }
-            }
-          },
-          required: ['toneSummary', 'compliantDraft', 'contextualIssues']
+            },
+            required: ['toneSummary', 'contextualIssues']
+          }
         }
-      }
-    });
+      });
 
-    const parsed = JSON.parse(response.text || '{}');
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error(`Contextual AI review timed out (8s limit on ${modelName})`));
+        }, 8000);
+        if (typeof timer.unref === 'function') timer.unref();
+      });
+
+      return await Promise.race([aiPromise, timeoutPromise]);
+    };
+
+    let response: any;
+    try {
+      response = await callGeminiWithTimeout('gemini-3.8-flash');
+    } catch (primaryErr: any) {
+      console.warn('[SkyNex AI] gemini-3.8-flash unavailable, attempting gemini-3.1-flash-lite fallback:', primaryErr?.message || primaryErr);
+      response = await callGeminiWithTimeout('gemini-3.1-flash-lite');
+    }
+
+    const rawJson = JSON.parse(response.text || '{}');
+    const validated = GeminiResponseSchema.safeParse(rawJson);
+
+    if (!validated.success) {
+      return {
+        additionalFindings: [],
+        toneSummary: 'Contextual AI response failed schema validation; deterministic checks completed.',
+        success: false,
+        errorMsg: 'Contextual AI response validation failed.'
+      };
+    }
+
     const additionalFindings: AuditFinding[] = [];
+    for (const issue of validated.data.contextualIssues) {
+      const span = issue.matchedSpan?.trim();
+      if (!span) continue;
 
-    if (Array.isArray(parsed.contextualIssues)) {
-      for (const issue of parsed.contextualIssues) {
-        if (!issue.matchedSpan || issue.matchedSpan.trim() === '') continue;
+      // Verify the span actually exists in draftText (never allow hallucinated excerpts)
+      const startIndex = draftText.indexOf(span);
+      if (startIndex === -1) continue;
+      const endIndex = startIndex + span.length;
 
-        // Prevent duplicate findings on exact same span
-        const alreadyCovered = deterministicFindings.some(df =>
-          df.originalSpan.toLowerCase() === issue.matchedSpan.toLowerCase()
-        );
-        if (alreadyCovered) continue;
+      // Deduplicate against deterministic findings and previous contextual findings
+      const overlaps = [...deterministicFindings, ...additionalFindings].some(
+        existing =>
+          existing.originalSpan.toLowerCase() === span.toLowerCase() ||
+          !(endIndex <= existing.startIndex || startIndex >= existing.endIndex)
+      );
+      if (overlaps) continue;
 
-        const idx = draftText.indexOf(issue.matchedSpan);
-        const startIndex = idx >= 0 ? idx : 0;
-        const endIndex = idx >= 0 ? idx + issue.matchedSpan.length : 0;
+      // Confirm that the cited ruleId exists in the approved knowledge base!
+      const verifiedRule = issue.ruleId ? approvedRuleMap.get(issue.ruleId) : undefined;
+      const fallbackRule =
+        verifiedRule ||
+        approvedRules.find(r => r.category === 'Performance & Claims') ||
+        approvedRules.find(r => r.category === 'Tone & Style') ||
+        approvedRules[0];
 
-        // Verify rule citation exists or default safely
-        const matchingRule = brand.guidelines.find(g =>
-          (issue.ruleId && g.id === issue.ruleId) ||
-          g.citation.toLowerCase().includes(issue.ruleCitation?.toLowerCase() || '')
-        );
+      const isUnsupported =
+        issue.classification === 'unsupported_claim' ||
+        issue.classification === 'needs_human_verification' ||
+        Boolean(issue.requiresHumanReview);
 
-        additionalFindings.push({
-          id: `gemini-${Date.now()}-${additionalFindings.length}`,
-          classification: issue.requiresHumanReview ? 'unsupported_claim' : 'style_tone_suggestion',
-          category: issue.category || 'Tone of Voice',
-          severity: (issue.severity?.toLowerCase() === 'critical' ? 'critical' : 'warning') as any,
-          originalSpan: issue.matchedSpan,
-          startIndex,
-          endIndex,
-          conflictText: `Contextual tone or unverified claim in "${issue.matchedSpan}"`,
-          ruleId: matchingRule ? matchingRule.id : undefined,
-          approvedRuleCitation: matchingRule ? matchingRule.citation : (issue.ruleCitation || 'Brand Guidelines 2026, Section 2'),
-          sourceReference: matchingRule?.sourceLabel || 'Brand Style Guide',
-          explanation: issue.explanation,
-          suggestedReplacement: issue.suggestedReplacement,
-          requiresHumanReview: Boolean(issue.requiresHumanReview),
-          engine: 'gemini',
-          decision: 'pending',
-          timestamp: new Date().toISOString()
-        });
-      }
+      additionalFindings.push({
+        id: `ai-${Date.now()}-${additionalFindings.length + 1}`,
+        classification: isUnsupported ? 'unsupported_claim' : 'style_tone_suggestion',
+        category: verifiedRule?.category || issue.category || 'Performance & Claims',
+        severity: isUnsupported ? 'warning' : 'info',
+        originalSpan: span,
+        startIndex,
+        endIndex,
+        conflictText: isUnsupported
+          ? `Contextual claim check: "${span}" lacks approved supporting evidence and requires human verification.`
+          : `Contextual tone & messaging suggestion for "${span}"`,
+        ruleId: verifiedRule ? verifiedRule.id : fallbackRule?.id,
+        ruleTitle: verifiedRule ? verifiedRule.title : fallbackRule?.title,
+        approvedRuleCitation: verifiedRule
+          ? verifiedRule.sourceRef
+          : fallbackRule?.sourceRef || 'Approved Brand Knowledge Base',
+        sourceReference: verifiedRule ? verifiedRule.sourceRef : fallbackRule?.sourceRef,
+        explanation: issue.explanation,
+        suggestedReplacement: issue.suggestedReplacement || verifiedRule?.approvedValue || undefined,
+        requiresHumanReview: isUnsupported,
+        engine: 'gemini',
+        decision: 'pending',
+        timestamp: new Date().toISOString()
+      });
     }
 
     return {
       additionalFindings,
-      toneSummary: parsed.toneSummary || 'Content contextual tone evaluated against active guidelines.',
-      compliantDraft: parsed.compliantDraft || draftText,
+      toneSummary: validated.data.toneSummary,
       success: true
     };
-  } catch (err) {
-    console.error('Gemini contextual evaluation failed, falling back:', err);
-    let fallbackCompliant = draftText;
-    for (const f of deterministicFindings) {
-      if (f.originalSpan && f.originalSpan !== 'Full Draft Body' && f.suggestedReplacement) {
-        fallbackCompliant = fallbackCompliant.split(f.originalSpan).join(f.suggestedReplacement);
-      }
-    }
+  } catch (err: any) {
+    console.error('[SkyNex AI] Gemini contextual review error:', err);
     return {
       additionalFindings: [],
-      toneSummary: 'Gemini contextual review unavailable; deterministic rule engine executed with 100% precision.',
-      compliantDraft: fallbackCompliant,
-      success: false
+      toneSummary: 'Contextual AI service encountered an error. Deterministic rule checks completed reliably; contextual review is marked incomplete.',
+      success: false,
+      errorMsg: err?.message || 'External AI service unavailable'
     };
   }
 }
 
-// ----------------------------------------------------
-// API Routes
-// ----------------------------------------------------
+// ---------------------------------------------------------------------------
+// 3. RECURRING ISSUES ENGINE (Rule-ID Matched, Configurable 7-Day Window)
+// ---------------------------------------------------------------------------
+function computeRecurringPatterns(): RecurringPattern[] {
+  const { minOccurrences, minDistinctDrafts, windowDays } = store.recurrenceConfig;
+  const cutoffMs = Date.now() - windowDays * 24 * 60 * 60 * 1000;
 
-// 1. Health checks
-app.get('/api/health', (req: Request, res: Response) => {
+  // Group deterministic findings by (brandId + ruleId) within the time window.
+  // Requirement: "Deterministic findings can be matched using the same approved rule identifier.
+  // Contextual findings should not be grouped merely because their categories are similar."
+  const ruleGroups = new Map<
+    string,
+    {
+      brandId: string;
+      brandName: string;
+      ruleId: string;
+      ruleTitle: string;
+      category: string;
+      ruleCitation: string;
+      conflictSummary: string;
+      occurrences: number;
+      draftMap: Map<string, AffectedDraftRef>;
+      channels: Set<string>;
+      firstSeen: string;
+      lastSeen: string;
+    }
+  >();
+
+  // Walk history from oldest to newest
+  const chronological = [...store.auditHistory].sort(
+    (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+  );
+
+  for (const report of chronological) {
+    const reportTime = new Date(report.createdAt).getTime();
+    if (reportTime < cutoffMs) continue;
+
+    for (const finding of report.findings) {
+      // Only group deterministic findings with a verified approved ruleId
+      if (finding.engine !== 'deterministic' || !finding.ruleId) continue;
+
+      const key = `${report.brandId}::${finding.ruleId}`;
+      const existing = ruleGroups.get(key);
+      const dateStr = report.createdAt.split('T')[0];
+
+      // Look up canonical rule title if available
+      const brandObj = store.brands[report.brandId];
+      const canonicalRule = brandObj?.rules.find(r => r.id === finding.ruleId);
+
+      if (!existing) {
+        const draftMap = new Map<string, AffectedDraftRef>();
+        draftMap.set(report.id, {
+          reportId: report.id,
+          title: report.title,
+          contentType: report.contentType,
+          submittedAt: report.createdAt,
+          matchedSpan: finding.originalSpan
+        });
+
+        ruleGroups.set(key, {
+          brandId: report.brandId,
+          brandName: report.brandName || brandObj?.name || report.brandId,
+          ruleId: finding.ruleId,
+          ruleTitle: canonicalRule?.title || finding.ruleTitle || finding.ruleId,
+          category: canonicalRule?.category || finding.category,
+          ruleCitation: canonicalRule?.sourceRef || finding.approvedRuleCitation,
+          conflictSummary: finding.conflictText,
+          occurrences: 1,
+          draftMap,
+          channels: new Set([report.contentType]),
+          firstSeen: dateStr,
+          lastSeen: dateStr
+        });
+      } else {
+        existing.occurrences += 1;
+        existing.lastSeen = dateStr;
+        existing.channels.add(report.contentType);
+        if (!existing.draftMap.has(report.id)) {
+          existing.draftMap.set(report.id, {
+            reportId: report.id,
+            title: report.title,
+            contentType: report.contentType,
+            submittedAt: report.createdAt,
+            matchedSpan: finding.originalSpan
+          });
+        }
+      }
+    }
+  }
+
+  const results: RecurringPattern[] = [];
+  for (const [key, group] of ruleGroups.entries()) {
+    const distinctDraftCount = group.draftMap.size;
+    const thresholdTriggered =
+      group.occurrences >= minOccurrences && distinctDraftCount >= minDistinctDrafts;
+
+    const savedInv = store.investigations[key];
+    let status: RecurringPattern['status'] = thresholdTriggered ? 'alert_active' : 'monitoring';
+    if (savedInv?.status && (savedInv.status === 'investigating' || savedInv.status === 'resolved')) {
+      status = savedInv.status;
+    }
+
+    results.push({
+      id: key,
+      brandId: group.brandId as any,
+      brandName: group.brandName,
+      category: group.category,
+      ruleId: group.ruleId,
+      ruleTitle: group.ruleTitle,
+      ruleCitation: group.ruleCitation,
+      conflictSummary: group.conflictSummary,
+      occurrenceCount: group.occurrences,
+      distinctDraftCount,
+      affectedDrafts: Array.from(group.draftMap.values()).reverse(),
+      affectedChannels: Array.from(group.channels),
+      firstSeen: group.firstSeen,
+      lastSeen: group.lastSeen,
+      thresholdTriggered,
+      status,
+      rootCause: savedInv?.rootCause,
+      rootCauseNotes: savedInv?.rootCauseNotes,
+      correctiveActionTaken: savedInv?.correctiveActionTaken,
+      investigatedBy: savedInv?.investigatedBy,
+      actionDate: savedInv?.actionDate
+    });
+  }
+
+  // Sort triggered alerts first, then by occurrence count descending
+  results.sort((a, b) => {
+    if (a.thresholdTriggered !== b.thresholdTriggered) {
+      return a.thresholdTriggered ? -1 : 1;
+    }
+    return b.occurrenceCount - a.occurrenceCount;
+  });
+
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// 4. API ENDPOINTS
+// ---------------------------------------------------------------------------
+
+// Health check
+app.get('/api/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
-    uptimeSeconds: Math.floor(process.uptime()),
-    timestamp: new Date().toISOString(),
-    components: {
-      server: 'healthy',
-      database: 'connected',
-      geminiApi: genAiClient ? 'configured' : 'fallback_mode',
-      documentExtractor: 'ready'
-    },
-    version: '1.0.0-production'
+    geminiConfigured: Boolean(genAiClient),
+    timestamp: new Date().toISOString()
   });
 });
 
-app.get('/api/health/live', (req: Request, res: Response) => {
-  res.status(200).send('OK');
+// Unified state loader for frontend initialization & reload persistence
+app.get('/api/state', (_req: Request, res: Response) => {
+  const recurringPatterns = computeRecurringPatterns();
+  res.json({
+    brands: store.brands,
+    auditHistory: store.auditHistory,
+    recurringPatterns,
+    recurrenceConfig: store.recurrenceConfig,
+    geminiAvailable: Boolean(genAiClient)
+  });
 });
 
-// 2. Document Text Extraction Endpoint (PRD Section 6.1)
-// Supports .txt, .md, .docx, and .pdf up to 10MB
+// Create a Brand Rule
+app.post('/api/brands/:brandId/rules', (req: Request, res: Response) => {
+  const { brandId } = req.params;
+  const brand = store.brands[brandId];
+  if (!brand) {
+    return res.status(404).json({ error: `Brand profile "${brandId}" not found.` });
+  }
+
+  const {
+    title,
+    category,
+    ruleStatement,
+    targetPatterns,
+    approvedValue,
+    sourceRef,
+    status,
+    classification,
+    severity,
+    explanation
+  } = req.body;
+
+  if (!title?.trim() || !approvedValue?.trim()) {
+    return res.status(400).json({ error: 'Rule title and approved content/value are required.' });
+  }
+
+  const prefix = brandId === 'novapay' ? 'NP' : brandId === 'aerosip' ? 'AS' : 'SN';
+  const nextNum = brand.rules.length + 1;
+  const ruleId = `${prefix}-RULE-${String(nextNum).padStart(2, '0')}`;
+
+  const parsedPatterns: string[] = Array.isArray(targetPatterns)
+    ? targetPatterns.map((p: string) => p.trim()).filter(Boolean)
+    : typeof targetPatterns === 'string'
+    ? targetPatterns
+        .split(',')
+        .map(p => p.trim())
+        .filter(Boolean)
+    : [];
+
+  const newRule: BrandRule = {
+    id: ruleId,
+    brandId: brand.id,
+    category: category || 'Terminology',
+    title: title.trim(),
+    ruleStatement: ruleStatement?.trim() || `Enforce "${approvedValue.trim()}" instead of ${parsedPatterns.join(', ') || 'unapproved variants'}.`,
+    targetPatterns: parsedPatterns,
+    approvedValue: approvedValue.trim(),
+    sourceRef: sourceRef?.trim() || `${brand.name} Governance Standard 2026`,
+    status: status === 'Approved' ? 'Approved' : status === 'Unverified' ? 'Unverified' : 'Draft',
+    classification:
+      classification ||
+      (category === 'Pricing & Facts'
+        ? 'approved_fact_conflict'
+        : category === 'Prohibited Claim'
+        ? 'prohibited_claim'
+        : category === 'Performance & Claims'
+        ? 'unsupported_claim'
+        : category === 'Tone & Style'
+        ? 'style_tone_suggestion'
+        : 'confirmed_rule_conflict'),
+    severity: severity || 'critical',
+    explanation:
+      explanation?.trim() ||
+      `Flagged under ${ruleId} (${title.trim()}). Approved value is "${approvedValue.trim()}".`,
+    updatedAt: new Date().toISOString().split('T')[0]
+  };
+
+  brand.rules.unshift(newRule);
+  savePersistentState(store);
+
+  res.json({
+    success: true,
+    rule: newRule,
+    brand
+  });
+});
+
+// Update / Edit or Change Approval Status of an existing Brand Rule
+app.put('/api/brands/:brandId/rules/:ruleId', (req: Request, res: Response) => {
+  const { brandId, ruleId } = req.params;
+  const brand = store.brands[brandId];
+  if (!brand) {
+    return res.status(404).json({ error: `Brand profile "${brandId}" not found.` });
+  }
+
+  const ruleIndex = brand.rules.findIndex(r => r.id === ruleId);
+  if (ruleIndex === -1) {
+    return res.status(404).json({ error: `Rule "${ruleId}" not found.` });
+  }
+
+  const existing = brand.rules[ruleIndex];
+  const {
+    title,
+    category,
+    ruleStatement,
+    targetPatterns,
+    approvedValue,
+    sourceRef,
+    status,
+    classification,
+    severity,
+    explanation
+  } = req.body;
+
+  const parsedPatterns: string[] =
+    targetPatterns !== undefined
+      ? Array.isArray(targetPatterns)
+        ? targetPatterns.map((p: string) => p.trim()).filter(Boolean)
+        : String(targetPatterns)
+            .split(',')
+            .map(p => p.trim())
+            .filter(Boolean)
+      : existing.targetPatterns;
+
+  const updatedRule: BrandRule = {
+    ...existing,
+    title: title !== undefined ? title.trim() : existing.title,
+    category: category !== undefined ? category : existing.category,
+    ruleStatement: ruleStatement !== undefined ? ruleStatement.trim() : existing.ruleStatement,
+    targetPatterns: parsedPatterns,
+    approvedValue: approvedValue !== undefined ? approvedValue.trim() : existing.approvedValue,
+    sourceRef: sourceRef !== undefined ? sourceRef.trim() : existing.sourceRef,
+    status: status !== undefined ? status : existing.status,
+    classification: classification !== undefined ? classification : existing.classification,
+    severity: severity !== undefined ? severity : existing.severity,
+    explanation: explanation !== undefined ? explanation.trim() : existing.explanation,
+    updatedAt: new Date().toISOString().split('T')[0]
+  };
+
+  brand.rules[ruleIndex] = updatedRule;
+  savePersistentState(store);
+
+  res.json({
+    success: true,
+    rule: updatedRule,
+    brand
+  });
+});
+
+// Delete a Brand Rule
+app.delete('/api/brands/:brandId/rules/:ruleId', (req: Request, res: Response) => {
+  const { brandId, ruleId } = req.params;
+  const brand = store.brands[brandId];
+  if (!brand) {
+    return res.status(404).json({ error: `Brand profile "${brandId}" not found.` });
+  }
+
+  brand.rules = brand.rules.filter(r => r.id !== ruleId);
+  savePersistentState(store);
+
+  res.json({
+    success: true,
+    brand
+  });
+});
+
+// Document Text Extraction (.txt, .md, .docx, .pdf)
 app.post('/api/extract-text', async (req: Request, res: Response) => {
   try {
     const { filename, base64Content } = req.body;
     if (!filename || !base64Content) {
-      return res.status(400).json({ error: 'Filename and base64Content are required' });
+      return res.status(400).json({
+        error: 'Both filename and file content are required. Please select a valid file or paste text directly.'
+      });
     }
 
     const buffer = Buffer.from(base64Content, 'base64');
     const fileSizeMB = buffer.length / (1024 * 1024);
     if (fileSizeMB > 10) {
       return res.status(400).json({
-        error: `File size (${fileSizeMB.toFixed(1)}MB) exceeds maximum limit of 10MB`
+        error: `File size (${fileSizeMB.toFixed(1)} MB) exceeds the 10 MB limit. Please upload a smaller file or paste the text directly.`
       });
     }
 
@@ -478,27 +855,26 @@ app.post('/api/extract-text', async (req: Request, res: Response) => {
       const docxResult = await mammoth.extractRawText({ buffer });
       extractedText = docxResult.value;
     } else if (ext === '.pdf') {
-      // Dynamic import or pdf-parse execution
       try {
         const pdfModule = await import('pdf-parse');
         const pdfFunc = (pdfModule as any).default || pdfModule;
         const pdfData = await pdfFunc(buffer);
         extractedText = pdfData.text;
-      } catch (pdfErr) {
-        // Fallback for simple text pdfs if worker issue
-        extractedText = buffer.toString('latin1').replace(/[^\x20-\x7E\n\r\t]/g, ' ');
+      } catch (pdfErr: any) {
+        return res.status(422).json({
+          error: `Could not extract text from PDF "${filename}" (${pdfErr?.message || 'unreadable PDF structure'}). Please paste your text directly into the editor.`
+        });
       }
     } else {
       return res.status(400).json({
-        error: `Unsupported file format "${ext}". Supported formats are .txt, .md, .docx, and .pdf.`
+        error: `Unsupported file format "${ext || 'unknown'}". SkyNex AI supports text extraction from .txt, .md, .docx, and text-based .pdf files. Please use the Paste Text editor instead.`
       });
     }
 
     const cleanText = extractedText.trim();
     if (!cleanText) {
       return res.status(422).json({
-        error: 'No extractable text found in document. Please use paste input fallback.',
-        isExtractable: false
+        error: `No extractable text was found inside "${filename}" (it may be an empty file or a scanned image without text). Please paste your text directly into the editor.`
       });
     }
 
@@ -507,264 +883,329 @@ app.post('/api/extract-text', async (req: Request, res: Response) => {
       filename,
       extractedText: cleanText,
       charCount: cleanText.length,
-      wordCount: cleanText.split(/\s+/).length
+      wordCount: cleanText.split(/\s+/).filter(Boolean).length
     });
   } catch (err: any) {
-    console.error('Extraction failed:', err);
+    console.error('[SkyNex AI] Document extraction error:', err);
     res.status(500).json({
-      error: `Document extraction failed: ${err.message || 'Corrupted or unreadable file'}. Please use text-paste fallback.`
+      error: `Document extraction failed: ${err?.message || 'Unreadable file'}. Please paste your text directly into the editor.`
     });
   }
 });
 
-// 3. Brands & Guidelines
-app.get('/api/brands', (req: Request, res: Response) => {
-  res.json({ brands: Object.values(brandStore) });
-});
-
-app.get('/api/brands/:brandId', (req: Request, res: Response) => {
-  const brand = brandStore[req.params.brandId];
-  if (!brand) return res.status(404).json({ error: 'Brand not found' });
-  res.json(brand);
-});
-
-// Add new active guideline rule (PRD Section 6.4)
-app.post('/api/brands/:brandId/rules', (req: Request, res: Response) => {
-  const brand = brandStore[req.params.brandId];
-  if (!brand) return res.status(404).json({ error: 'Brand not found' });
-
-  const { category, title, rule, rationale, severity, citation, sourceLabel } = req.body;
-  if (!rule || !title) {
-    return res.status(400).json({ error: 'Title and Rule text are required' });
-  }
-
-  const newRule: GuidelineRule = {
-    id: `${brand.id.slice(0, 2).toUpperCase()}-G${String(brand.guidelines.length + 1).padStart(2, '0')}`,
-    category: category || 'Terminology',
-    title,
-    rule,
-    rationale: rationale || 'Added by brand administrator.',
-    severity: severity || 'warning',
-    citation: citation || `${title} (v1.0)`,
-    sourceLabel: sourceLabel || 'Admin Portal',
-    status: 'active',
-    version: '1.0'
-  };
-
-  brand.guidelines.unshift(newRule);
-  res.json({ success: true, rule: newRule });
-});
-
-// 4. Main Audit Endpoint
-const AuditRequestSchema = z.object({
-  brandId: z.enum(['aerosip', 'novapay']),
-  draftText: z.string().min(1, 'Draft content cannot be empty'),
-  campaign: z.string().default('General Campaign'),
-  contentType: z.string().default('Marketing Copy'),
-  title: z.string().optional(),
-  enableGemini: z.boolean().default(true)
-});
-
+// Main Review & Audit Endpoint
 app.post('/api/audit', async (req: Request, res: Response) => {
-  const parsed = AuditRequestSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: 'Invalid audit request', details: parsed.error.format() });
+  const {
+    brandId,
+    draftText,
+    contentType = 'Advertisement',
+    title = 'Submitted Content Draft',
+    sourceFilename,
+    enableGemini = true,
+    simulateAiFailure = false,
+    submittedBy = 'Marcus Vance',
+    submittedByRole = 'Brand Governance Lead',
+    submittedByRoleKey = 'brand_manager'
+  } = req.body;
+
+  if (!draftText || !String(draftText).trim()) {
+    return res.status(400).json({ error: 'Draft content cannot be empty. Please enter or upload text to review.' });
   }
 
-  const { brandId, draftText, campaign, contentType, title, enableGemini } = parsed.data;
-  const brand = brandStore[brandId];
-  if (!brand) return res.status(404).json({ error: `Brand ${brandId} not found` });
+  const brand = store.brands[brandId];
+  if (!brand) {
+    return res.status(404).json({ error: `Brand profile "${brandId}" not found.` });
+  }
 
-  // 1. Run deterministic checks
-  const deterministicFindings = runDeterministicAudit(brand, draftText);
+  const cleanDraft = String(draftText);
 
-  // 2. Run Gemini contextual analysis if enabled
-  let geminiResult = {
-    additionalFindings: [] as AuditFinding[],
-    toneSummary: 'Deterministic rule checks completed.',
-    compliantDraft: draftText,
-    success: false
+  // Step 1: Run Deterministic Rules Engine against ONLY Approved rules
+  const { findings: deterministicFindings, approvedRulesCount } = runDeterministicAudit(brand, cleanDraft);
+
+  // Step 2: Run AI-Assisted Contextual Review if enabled
+  let geminiResult: GeminiAuditResult = {
+    additionalFindings: [],
+    toneSummary: 'Contextual AI check was disabled by user. Deterministic checks ran against all approved rules.',
+    success: false,
+    errorMsg: undefined
   };
 
   if (enableGemini) {
-    geminiResult = await runGeminiContextualAudit(brand, draftText, deterministicFindings);
+    geminiResult = await runGeminiContextualAudit(
+      brand,
+      cleanDraft,
+      deterministicFindings,
+      Boolean(simulateAiFailure)
+    );
   }
 
-  const allFindings = [...deterministicFindings, ...geminiResult.additionalFindings];
+  const allFindings = [...deterministicFindings, ...geminiResult.additionalFindings].sort(
+    (a, b) => a.startIndex - b.startIndex
+  );
 
-  // Determine explicit overall status according to PRD Section 6.2
+  // Determine overall status honestly (Requirement 8: Never use absence of detected issues or AI failure to claim full compliance)
   let overallStatus: ReviewStatusOutcome = 'no_issues_detected';
   if (allFindings.length > 0) {
-    const hasUnverifiedOnly = allFindings.every(f => f.classification === 'unsupported_claim' || f.classification === 'needs_human_verification');
-    overallStatus = hasUnverifiedOnly ? 'needs_human_verification' : 'issues_found';
-  } else if (enableGemini && !geminiResult.success && genAiClient) {
+    const onlyVerificationOrStyle = allFindings.every(
+      f =>
+        f.classification === 'unsupported_claim' ||
+        f.classification === 'needs_human_verification'
+    );
+    overallStatus = onlyVerificationOrStyle ? 'needs_human_verification' : 'issues_found';
+  } else if (enableGemini && !geminiResult.success) {
     overallStatus = 'partial_review_ai_unavailable';
   }
 
-  const reportId = `rep_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  const reportId = `REV-2026-${Math.floor(104 + store.auditHistory.length + Math.random() * 890)}`;
+  const nowIso = new Date().toISOString();
+
   const initialVersion: DraftVersion = {
     versionNumber: 1,
-    contentText: draftText,
-    changeSummary: 'Original submitted draft',
-    createdByRole: 'Creator',
-    createdAt: new Date().toISOString()
+    contentText: cleanDraft,
+    changeSummary: 'Original submitted draft (preserved)',
+    createdBy: submittedBy,
+    createdByRole: submittedByRole,
+    createdAt: nowIso
   };
 
   const report: AuditReport = {
     id: reportId,
-    brandId,
-    campaign,
+    brandId: brand.id,
+    brandName: brand.name,
+    campaign: title,
     contentType,
-    title: title || `${campaign} Draft`,
-    originalText: draftText,
-    currentText: draftText,
+    title,
+    sourceFilename,
+    originalText: cleanDraft,
+    currentText: cleanDraft,
     versions: [initialVersion],
     findings: allFindings,
+    toneSummary: geminiResult.toneSummary,
     checksExecuted: {
       deterministic: true,
-      geminiContextual: enableGemini,
-      geminiSuccess: geminiResult.success
+      deterministicRulesChecked: approvedRulesCount,
+      geminiContextual: Boolean(enableGemini),
+      geminiSuccess: geminiResult.success,
+      geminiError: geminiResult.errorMsg
     },
     overallStatus,
-    createdAt: new Date().toISOString()
+    contentApprovalStatus: 'pending_review',
+    submittedBy,
+    submittedByRole,
+    submittedByRoleKey,
+    createdAt: nowIso
   };
 
-  auditHistory.unshift(report);
+  store.auditHistory.unshift(report);
+  savePersistentState(store);
 
-  // Update Brand Clarity Loop recurrence tracker (PRD Section 6.6)
-  // Deduplicate same rule within a single draft
-  const loggedRulesInDraft = new Set<string>();
-  for (const finding of allFindings) {
-    const citation = finding.approvedRuleCitation;
-    if (loggedRulesInDraft.has(citation)) continue;
-    loggedRulesInDraft.add(citation);
-
-    const existing = recurringPatterns.find(p =>
-      p.brandId === brandId && p.ruleCitation === citation
-    );
-
-    if (existing) {
-      existing.occurrenceCount += 1;
-      existing.distinctDraftCount += 1;
-      existing.lastSeen = new Date().toISOString().split('T')[0];
-      if (!existing.campaignsInvolved.includes(campaign)) {
-        existing.campaignsInvolved.push(campaign);
-      }
-      // Trigger threshold: 3 confirmed findings across at least 2 distinct drafts
-      if (existing.occurrenceCount >= 3 && existing.distinctDraftCount >= 2 && existing.status !== 'investigating') {
-        existing.status = 'alert_active';
-      }
-    } else {
-      recurringPatterns.push({
-        id: `pat-${Date.now()}-${recurringPatterns.length}`,
-        brandId,
-        category: finding.category,
-        ruleCitation: citation,
-        ruleId: finding.ruleId,
-        conflictSummary: finding.conflictText,
-        occurrenceCount: 1,
-        distinctDraftCount: 1,
-        creatorsInvolved: ['Content Creator'],
-        campaignsInvolved: [campaign],
-        firstSeen: new Date().toISOString().split('T')[0],
-        lastSeen: new Date().toISOString().split('T')[0],
-        status: 'alert_active'
-      });
-    }
-  }
+  const recurringPatterns = computeRecurringPatterns();
 
   res.json({
+    success: true,
     report,
-    toneSummary: geminiResult.toneSummary,
-    suggestedDraft: geminiResult.compliantDraft
+    recurringPatterns
   });
 });
 
-// 5. Brand Clarity Loop & Manager Alerts (PRD Section 6.6)
-app.get('/api/clarity-loop', (req: Request, res: Response) => {
-  const brandId = req.query.brandId as string;
-  let list = recurringPatterns;
-  if (brandId && brandId !== 'all') {
-    list = recurringPatterns.filter(p => p.brandId === brandId);
+// Human Decision on an Individual Finding (Accept, Edit, Reject, Request Verification, or Revert)
+app.post('/api/history/:reportId/decision', (req: Request, res: Response) => {
+  const { reportId } = req.params;
+  const {
+    findingId,
+    decision,
+    editedReplacement,
+    rejectionReason,
+    reviewerComment,
+    decidedBy = 'Marcus Vance',
+    decidedByRole = 'Brand Governance Lead'
+  } = req.body;
+
+  const report = store.auditHistory.find(r => r.id === reportId);
+  if (!report) {
+    return res.status(404).json({ error: `Review record "${reportId}" could not be found. Saving decision failed.` });
   }
-  res.json({
-    patterns: list,
-    summary: {
-      totalViolationsTracked: list.reduce((acc, p) => acc + p.occurrenceCount, 0),
-      activeAlerts: list.filter(p => p.status === 'alert_active').length,
-      underInvestigation: list.filter(p => p.status === 'investigating').length,
-      resolvedCount: list.filter(p => p.status === 'resolved').length
-    }
-  });
-});
-
-app.post('/api/clarity-loop/action', (req: Request, res: Response) => {
-  const { patternId, rootCause, rootCauseNotes, correctiveAction, newStatus } = req.body;
-  const pattern = recurringPatterns.find(p => p.id === patternId);
-  if (!pattern) return res.status(404).json({ error: 'Pattern not found' });
-
-  pattern.rootCause = rootCause;
-  pattern.rootCauseNotes = rootCauseNotes;
-  pattern.correctiveActionTaken = correctiveAction;
-  pattern.status = newStatus;
-  pattern.actionDate = new Date().toISOString().split('T')[0];
-
-  res.json({ success: true, pattern });
-});
-
-// 6. Human Decision Handler (PRD Section 6.3)
-app.post('/api/history/decision', (req: Request, res: Response) => {
-  const { reportId, findingId, decision, editedReplacement, rejectionReason, reviewerComment, updatedFullText } = req.body;
-  const report = auditHistory.find(r => r.id === reportId);
-  if (!report) return res.status(404).json({ error: 'Report not found' });
 
   const finding = report.findings.find(f => f.id === findingId);
-  if (finding) {
-    finding.decision = decision;
-    finding.editedReplacement = editedReplacement;
-    finding.rejectionReason = rejectionReason;
-    finding.reviewerComment = reviewerComment;
+  if (!finding) {
+    return res.status(404).json({ error: `Finding "${findingId}" not found in review "${reportId}".` });
   }
 
-  // Create new version and record change
-  if (decision === 'accepted' || decision === 'edited') {
-    report.currentText = updatedFullText;
-    const newVersionNum = report.versions.length + 1;
-    report.versions.push({
-      versionNumber: newVersionNum,
-      contentText: updatedFullText,
-      changeSummary: decision === 'accepted'
-        ? `Applied correction: "${finding?.suggestedReplacement}"`
-        : `Custom edited: "${editedReplacement}"`,
-      createdByRole: 'Creator / Reviewer',
-      createdAt: new Date().toISOString()
-    });
+  finding.decision = decision as DecisionStatus;
+  finding.editedReplacement = editedReplacement;
+  finding.rejectionReason = rejectionReason;
+  finding.reviewerComment = reviewerComment;
+  finding.decidedBy = decidedBy;
+  finding.decidedAt = new Date().toISOString();
+
+  // Recompute working draft cleanly from originalText by applying all accepted/edited findings in reverse offset order
+  // so that originalText is NEVER lost and toggling decisions is 100% deterministic and reversible!
+  let workingText = report.originalText;
+  const appliedFindings = report.findings
+    .filter(f => (f.decision === 'accepted' || f.decision === 'edited') && f.originalSpan)
+    .sort((a, b) => b.startIndex - a.startIndex);
+
+  for (const af of appliedFindings) {
+    const replacement =
+      af.decision === 'edited' && af.editedReplacement !== undefined
+        ? af.editedReplacement
+        : af.suggestedReplacement || af.originalSpan;
+
+    if (
+      af.startIndex >= 0 &&
+      af.endIndex <= workingText.length &&
+      workingText.slice(af.startIndex, af.endIndex).toLowerCase() === af.originalSpan.toLowerCase()
+    ) {
+      workingText =
+        workingText.slice(0, af.startIndex) + replacement + workingText.slice(af.endIndex);
+    } else if (workingText.includes(af.originalSpan)) {
+      workingText = workingText.replace(af.originalSpan, replacement);
+    }
   }
 
+  report.currentText = workingText;
+
+  // Record a new version in report.versions
+  const actionLabel =
+    decision === 'accepted'
+      ? `Accepted suggestion for "${finding.originalSpan}" → "${finding.suggestedReplacement}"`
+      : decision === 'edited'
+      ? `Edited suggestion for "${finding.originalSpan}" → "${editedReplacement}"`
+      : decision === 'rejected'
+      ? `Rejected suggestion for "${finding.originalSpan}" (preserved original wording${rejectionReason ? `: ${rejectionReason}` : ''})`
+      : decision === 'verification_requested'
+      ? `Requested human verification for "${finding.originalSpan}"`
+      : `Reset decision for "${finding.originalSpan}" to pending`;
+
+  report.versions.push({
+    versionNumber: report.versions.length + 1,
+    contentText: workingText,
+    changeSummary: actionLabel,
+    createdBy: decidedBy,
+    createdByRole: decidedByRole,
+    createdAt: new Date().toISOString()
+  });
+
+  // Update overall finding resolution status (kept distinct from final content approval!)
   const pendingCount = report.findings.filter(f => f.decision === 'pending').length;
-  if (pendingCount === 0) {
+  if (report.findings.length > 0 && pendingCount === 0) {
     report.overallStatus = 'changes_applied';
+  } else if (report.findings.length > 0) {
+    const onlyVerification = report.findings.every(
+      f => f.classification === 'unsupported_claim' || f.classification === 'needs_human_verification'
+    );
+    report.overallStatus = onlyVerification ? 'needs_human_verification' : 'issues_found';
+  }
+
+  savePersistentState(store);
+
+  res.json({
+    success: true,
+    report
+  });
+});
+
+// Separate Final Content Approval Decision (Step 5: "The final approval of an entire content item must remain separate from decisions about individual suggestions")
+app.post('/api/history/:reportId/approval', (req: Request, res: Response) => {
+  const { reportId } = req.params;
+  const {
+    contentApprovalStatus,
+    contentApprovedBy = 'Marcus Vance',
+    contentApprovalNotes
+  } = req.body;
+
+  const report = store.auditHistory.find(r => r.id === reportId);
+  if (!report) {
+    return res.status(404).json({ error: `Review record "${reportId}" not found.` });
+  }
+
+  report.contentApprovalStatus = contentApprovalStatus as ContentApprovalStatus;
+  report.contentApprovedBy = contentApprovedBy;
+  report.contentApprovedAt = new Date().toISOString();
+  if (contentApprovalNotes !== undefined) {
+    report.contentApprovalNotes = contentApprovalNotes;
+  }
+  if (contentApprovalStatus === 'approved_for_publication') {
     report.completedAt = new Date().toISOString();
   }
 
-  res.json({ success: true, report });
+  savePersistentState(store);
+
+  res.json({
+    success: true,
+    report
+  });
 });
 
-app.get('/api/history', (req: Request, res: Response) => {
-  res.json({ history: auditHistory });
+// Manager Investigation & Corrective Action on Recurring Issue
+app.post('/api/clarity-loop/action', (req: Request, res: Response) => {
+  const {
+    patternId,
+    rootCause,
+    rootCauseNotes,
+    correctiveAction,
+    newStatus,
+    investigatedBy = 'Marcus Vance'
+  } = req.body;
+
+  if (!patternId) {
+    return res.status(400).json({ error: 'patternId is required.' });
+  }
+
+  store.investigations[patternId] = {
+    status: newStatus || 'investigating',
+    rootCause,
+    rootCauseNotes,
+    correctiveActionTaken: correctiveAction,
+    investigatedBy,
+    actionDate: new Date().toISOString().split('T')[0]
+  };
+
+  savePersistentState(store);
+  const recurringPatterns = computeRecurringPatterns();
+
+  res.json({
+    success: true,
+    recurringPatterns
+  });
 });
 
-// 7. Demo Reset Endpoint (PRD Section 6.7)
-app.post('/api/demo/reset', (req: Request, res: Response) => {
-  brandStore = JSON.parse(JSON.stringify(BRANDS));
-  recurringPatterns = JSON.parse(JSON.stringify(INITIAL_RECURRING_PATTERNS));
-  auditHistory = [];
-  res.json({ success: true, message: 'SkyNex AI demo data reset to canonical pristine state.' });
+// Update Configurable Recurrence Threshold
+app.post('/api/clarity-loop/config', (req: Request, res: Response) => {
+  const { minOccurrences, minDistinctDrafts, windowDays } = req.body;
+  store.recurrenceConfig = {
+    minOccurrences: Math.max(1, Number(minOccurrences) || 3),
+    minDistinctDrafts: Math.max(1, Number(minDistinctDrafts) || 2),
+    windowDays: Math.max(1, Number(windowDays) || 7)
+  };
+  savePersistentState(store);
+  const recurringPatterns = computeRecurringPatterns();
+
+  res.json({
+    success: true,
+    recurrenceConfig: store.recurrenceConfig,
+    recurringPatterns
+  });
 });
 
-// ----------------------------------------------------
+// Reset Demo State to Canonical Seed
+app.post('/api/demo/reset', (_req: Request, res: Response) => {
+  store = getInitialState();
+  savePersistentState(store);
+  const recurringPatterns = computeRecurringPatterns();
+
+  res.json({
+    success: true,
+    brands: store.brands,
+    auditHistory: store.auditHistory,
+    recurringPatterns,
+    recurrenceConfig: store.recurrenceConfig
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Vite Server Integration
-// ----------------------------------------------------
+// ---------------------------------------------------------------------------
 async function startServer() {
   if (!IS_PROD) {
     const { createServer: createViteServer } = await import('vite');
@@ -775,21 +1216,17 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (req: Request, res: Response) => {
+    app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
     });
   }
 
   const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[SkyNex AI] Server running on port ${PORT} (Node.js/Express)`);
+    console.log(`[SkyNex AI] Server running on port ${PORT}`);
   });
 
   const gracefulShutdown = () => {
-    console.log('[SkyNex AI] Shutting down gracefully...');
-    server.close(() => {
-      console.log('[SkyNex AI] Closed out connections.');
-      process.exit(0);
-    });
+    server.close(() => process.exit(0));
   };
 
   process.on('SIGTERM', gracefulShutdown);
